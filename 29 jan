@@ -1,0 +1,1894 @@
+Imports System
+Imports System.IO
+Imports System.IO.Ports
+Imports System.Reflection
+Imports System.Windows.Forms
+Imports ClosedXML.Excel
+Imports ScottPlot
+Imports ScottPlot.WinForms
+Imports SC = ScottPlot.Color
+Public Class Form1
+    Inherits Form
+    Private autoScrollEnabled As Boolean = True
+    ' Sensor Configuration Constants (Add these to your Form1 class, near MaxSensors)
+    Private ReadOnly FBG_WAVELENGTHS() As Double = {
+    1540.0, ' Ch 0 (Nominal Wavelength in nm)
+    1544.0, ' Ch 1
+    1548.0, ' Ch 2
+    1552.0, ' Ch 3
+    1556.0, ' Ch 4
+    1560.0, ' Ch 5
+    1564.0, ' Ch 6
+    1568.0  ' Ch 7
+}
+
+    ' CONVERSION FACTOR: nm shift per ADC count. (You must calibrate this)
+    Private Const NM_PER_ADC_STEP As Double = 0.0025D
+    ' --- PLOT WAVELENGTH CONFIGURATION (For Gaussian Mode) ---
+    ' The physical wavelength (nm) that the left edge (index 0) of the spectrum plot represents.
+    Private Const PLOT_MIN_WAVELENGTH As Double = 1530.0 ' Example start wavelength (adjust as needed)
+
+    ' The total wavelength span (nm) covered by the SpectrumLength indices (e.g., 256 pixels).
+    Private Const PLOT_NM_SPAN As Double = 8.0
+
+    ' Calculated constant: Pixels/Index per Nanometer
+    Private Const PIXELS_PER_NM As Double = SpectrumLength / PLOT_NM_SPAN
+
+
+
+    ' --- reduce flicker for all controls ---
+    Protected Overrides ReadOnly Property CreateParams As CreateParams
+        Get
+            Dim cp = MyBase.CreateParams
+            cp.ExStyle = cp.ExStyle Or &H2000000 ' WS_EX_COMPOSITED
+            Return cp
+        End Get
+    End Property
+    Private serialBuffer As String = ""
+    ' --- Smooth table scroll support ---
+    Private WithEvents TimerTableScroll As New Timer() With {.Interval = 16} ' ~60 FPS
+    Private pendingScrollIndex() As Integer
+
+    ''
+    Private tableBuffer As New List(Of FbgData)()
+    Private processQueue As New Queue(Of Long()) ' holds numeric values for processing
+
+    ' UI - top controls
+    Private comboBoxPorts As New ComboBox()
+    Private btnConnect As New Button()
+    Private btnSave As New Button()
+    Private btnSendL As New Button()
+    Private btnSendG As New Button()
+    Private btnSendS As New Button()
+    Private btnReset As New Button()
+    Private txtCommand As New TextBox()
+
+    ' Layout containers
+    Private mainTable As New TableLayoutPanel()
+    Private topFlow As New FlowLayoutPanel()
+    Private middleSplit As New SplitContainer()
+    Private rightTablesLayout As New TableLayoutPanel()
+    Private formsPlot1 As New FormsPlot()
+    Private textBoxLog As New TextBox()
+
+    ' DataGridViews (one per channel)
+
+    Private dgvCh() As DataGridView
+
+
+    ' Serial & data
+    Private serialPort As SerialPort
+    Private readQueue As New Queue(Of String)
+    Private dataList As New List(Of FbgData)                         ' final rows saved into CSV
+    Private continuousList As New List(Of String)                    ' raw bracket strings
+    Private currentIndex As Integer = 1
+
+    ' Config
+    'Private ReadOnly DefaultChannels As Integer = 4
+    'Private ReadOnly MaxPlotPoints As Integer = 2000                'Changed this 2000 to 256 in next line!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    Private ReadOnly MaxPlotPoints As Integer = 200
+
+
+    Private baselineReady As Boolean = False
+    Private waitingForBaseline As Boolean = False
+    Private baselineCollectCount As Integer = 0
+    Private baselineSet As Boolean = False
+
+
+    ' Temp snapshot builder (holds latest values until we store)
+    Private tempData As New FbgData()
+
+    ' Timer for UI update
+    Private timerPlot As New Timer() With {.Interval = 5}
+
+    ' Disturbance detection threshold (adjustable)
+    Private disturbanceThreshold As Integer = 50                     'changed threshold from 100 to 50!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    Private ReadOnly MaxSensors As Integer = 8          ' Maximum sensors supported
+    Private ActiveChannels As Integer = 4               ' Will be updated dynamically after calibration
+    Private plotData(MaxSensors - 1)() As Double
+    Private plotFlags(MaxSensors - 1)() As Boolean
+    Private baseline(MaxSensors - 1) As Integer
+    Private chInDisturbance(MaxSensors - 1) As Boolean
+    Private chWidthCounter(MaxSensors - 1) As Integer
+    Private chFromLastCounter(MaxSensors - 1) As Integer
+    Private chLastDisturbanceIndex(MaxSensors - 1) As Integer
+
+    Private nudThreshold As NumericUpDown
+
+
+
+
+    ' New data buffers for the Spectral View (one full array per channel)
+    Private spectrumData(MaxSensors - 1)() As Double
+
+
+    Private Const SpectrumLength As Integer = 256
+    Private Const GaussianWidth As Double = 1.5
+
+    ' NOISE PERCENTAGE:
+    ' 2.5% means: If baseline is 68,000, ignore changes +/- 1700.
+    '             If baseline is 12,000, ignore changes +/- 300.
+    ' Adjust this if the graph is still shaky (try 3.0 or 4.0).
+    Private Const NoisePercent As Double = 2.5
+
+    ' SENSITIVITY: 
+    ' Higher number = slower movement.
+    'Private Const ShiftSensitivity As Double = 100.0
+    ' The physical change required to reach the next sensor position
+    Private Const PhysicalWakeUpDelta As Double = 5000.0
+    ' Plot signals
+    Private plotSignals(MaxSensors - 1) As ScottPlot.Plottables.Signal
+    ' Linear signals (for the Value vs Time graph)
+    Private plotLinearSignals(MaxSensors - 1) As ScottPlot.Plottables.Signal
+
+    '  Arrays to hold the vertical marker lines
+    Private baseLines(MaxSensors - 1) As ScottPlot.Plottables.VerticalLine
+    Private moveLines(MaxSensors - 1) As ScottPlot.Plottables.VerticalLine
+
+    ' Polygons for the "Red Fill" effect
+    Private alarmPolygons(MaxSensors - 1) As ScottPlot.Plottables.Polygon
+
+
+    ' Create a flag to track the current mode
+    ' True = Linear Graph is showing, False = Gaussian is showing
+    Private isLinearMode As Boolean = False
+    ' Array to hold the dot markers for peaks
+    Private peakMarkers(MaxSensors - 1) As ScottPlot.Plottables.Marker
+    ' --- PHYSICAL CONSTANTS ---
+    ' Speed of light in vacuum (meters per second)
+    Private Const SPEED_OF_LIGHT_M_PER_S As Double = 299792458.0
+    Public Sub New()
+        Text = "FBG Interrogator"
+        WindowState = FormWindowState.Maximized
+
+        ' 1. ALLOCATE BUFFERS FIRST 
+        For i As Integer = 0 To ActiveChannels - 1
+            plotData(i) = New Double(MaxPlotPoints - 1) {}
+            plotFlags(i) = New Boolean(MaxPlotPoints - 1) {}
+        Next
+
+        ' 2. Setup overall layout and controls (calls SetupPlot, which references the initialized buffers)
+        SetupLayout()
+
+        ' 3. Call SetupPlot AFTER the buffers are allocated
+        SetupPlot()
+        ' --- Initialize smooth scroll system for DataGridViews ---
+        ReDim pendingScrollIndex(ActiveChannels - 1)
+        For i As Integer = 0 To ActiveChannels - 1
+            pendingScrollIndex(i) = -1
+        Next
+        If ActiveChannels > 0 Then
+            ReDim plotLabels(ActiveChannels - 1)
+        End If
+        TimerTableScroll.Start() ' Start smooth table scroll animation
+
+        ' --- (Optional but recommended) style DataGridViews ---
+        StyleTables()
+
+        RefreshComPorts()
+        AddHandler timerPlot.Tick, AddressOf TimerPlot_Tick
+        timerPlot.Start()
+        AddHandler Me.FormClosing, AddressOf Form1_FormClosing
+    End Sub
+
+    Private Sub SetupLayout()
+        ' Main table: 3 rows (top controls, middle split, bottom plot)
+        mainTable.Dock = DockStyle.Fill
+        mainTable.ColumnCount = 1
+        mainTable.RowCount = 3
+        mainTable.RowStyles.Add(New RowStyle(SizeType.AutoSize))                    ' top
+        mainTable.RowStyles.Add(New RowStyle(SizeType.Percent, 50.0F))              ' middle (upper half)
+        mainTable.RowStyles.Add(New RowStyle(SizeType.Percent, 50.0F))              ' bottom (lower half)
+        Controls.Add(mainTable)
+
+        ' --- Top flow (controls) ---
+        topFlow.Dock = DockStyle.Fill
+        topFlow.AutoSize = True
+        topFlow.FlowDirection = FlowDirection.LeftToRight
+        topFlow.Padding = New Padding(6)
+        mainTable.Controls.Add(topFlow, 0, 0)
+
+        ' Ports combo
+        comboBoxPorts.Width = 120
+        topFlow.Controls.Add(comboBoxPorts)
+
+        ' connect
+        btnConnect.Text = "Connect"
+        AddHandler btnConnect.Click, AddressOf btnConnect_Click
+        topFlow.Controls.Add(btnConnect)
+
+        ' Save
+        btnSave.Text = "Save"
+        AddHandler btnSave.Click, AddressOf btnSave_Click
+        topFlow.Controls.Add(btnSave)
+
+        ' Send L
+        btnSendL.Text = "Clear Buffer"
+        'AddHandler btnSendL.Click, Sub() SendCommand("L")
+        'topFlow.Controls.Add(btnSendL)
+        ' --- Modified Send L Button Logic ---
+        'btnSendL.Text = "Send 'L' & Clear"
+        AddHandler btnSendL.Click, Sub()
+                                       ' 1. Send the command to hardware
+                                       SendCommand("S")
+                                       ' --- Clear DataGridViews ---
+                                       For Each dgv In dgvCh
+                                           If dgv IsNot Nothing Then dgv.Rows.Clear()
+                                       Next
+
+                                       ' --- Clear plot ---
+                                       If formsPlot1 IsNot Nothing Then
+                                           formsPlot1.Plot.Clear()
+                                       End If
+
+                                       ' --- Clear log ---
+                                       If textBoxLog IsNot Nothing Then
+                                           textBoxLog.Clear()
+                                       End If
+
+                                       ' --- Reset internal variables ---
+                                       currentIndex = 1
+                                       dataList.Clear()
+                                       tableBuffer.Clear()
+
+                                       For ch As Integer = 0 To MaxSensors - 1
+                                           plotData(ch) = New Double(MaxPlotPoints - 1) {}
+                                           plotFlags(ch) = New Boolean(MaxPlotPoints - 1) {}
+                                           chInDisturbance(ch) = False
+                                           'chWidthCounter(ch) = 0
+                                           'chFromLastCounter(ch) = 0
+                                           'chLastDisturbanceIndex(ch) = 0
+                                           baseline(ch) = 0
+                                       Next
+                                       SetupPlot()
+
+                                       Log("System Reset: Buffers and Graphs cleared.")
+                                   End Sub
+        topFlow.Controls.Add(btnSendL)
+
+        ' Send G
+        btnSendG.Text = "Send 'G'"
+        AddHandler btnSendG.Click, Sub()
+                                       ' Just send the command to start streaming
+                                       SendCommand("G")
+                                       ' Enable scrolling so we see the new data
+                                       autoScrollEnabled = True
+                                       Log("Acquisition started (Manual Trigger).")
+                                   End Sub
+        topFlow.Controls.Add(btnSendG)
+
+        ' Send S
+        btnSendS.Text = "Send 'S'"
+        AddHandler btnSendS.Click, Sub()
+                                       ' Send the command
+                                       SendCommand("S")
+
+                                       ' Clear the table buffer so user can scroll manually
+                                       SyncLock tableBuffer
+                                           tableBuffer.Clear()
+                                       End SyncLock
+
+                                       ' Disable auto-scroll
+                                       autoScrollEnabled = False
+
+                                       Log("Data capture stopped. You can now scroll manually.")
+                                   End Sub
+
+        topFlow.Controls.Add(btnSendS)
+
+
+        ' Reset Arduino
+        btnReset.Text = "Reset Arduino"
+        AddHandler btnReset.Click, Sub() ResetArduino()
+        topFlow.Controls.Add(btnReset)
+
+        ' --- Toggle Graph Button ---
+        Dim btnToggleGraph As New Button()
+        btnToggleGraph.Text = "Switch Graph View"
+        btnToggleGraph.AutoSize = True
+        AddHandler btnToggleGraph.Click, AddressOf btnToggleGraph_Click
+        topFlow.Controls.Add(btnToggleGraph)
+
+
+
+        ' Command text
+        txtCommand.Width = 180
+        AddHandler txtCommand.KeyDown, AddressOf txtCommand_KeyDown
+        topFlow.Controls.Add(txtCommand)
+
+        ' --- Disturbance threshold NumericUpDown ---
+        nudThreshold = New System.Windows.Forms.NumericUpDown()
+        nudThreshold.Minimum = 1           ' 1%
+        nudThreshold.Maximum = 100         ' 100%
+        nudThreshold.Value = My.Settings.LastThreshold          ' Load saved value
+        nudThreshold.DecimalPlaces = 1
+        nudThreshold.Increment = 0.5D
+        nudThreshold.Width = 80
+        nudThreshold.TextAlign = System.Windows.Forms.HorizontalAlignment.Right
+
+        Dim lblThreshold As New System.Windows.Forms.Label()
+        lblThreshold.Text = "Disturbance %:"
+        lblThreshold.AutoSize = True
+        lblThreshold.TextAlign = System.Drawing.ContentAlignment.MiddleCenter
+        lblThreshold.Padding = New Padding(5, 8, 0, 0)
+
+        topFlow.Controls.Add(lblThreshold)
+        topFlow.Controls.Add(nudThreshold)
+
+
+
+        ' --- Middle split (log left, 4 DGVs right) ---
+        middleSplit.Dock = DockStyle.Fill
+        middleSplit.Orientation = System.Windows.Forms.Orientation.Vertical
+        middleSplit.SplitterDistance = CInt(Me.Width * 0.6) ' default, will adjust on resize
+
+        ' Left: log
+        Dim leftPanel As New Panel()
+        leftPanel.Dock = DockStyle.Fill
+        textBoxLog.Dock = DockStyle.Fill
+        textBoxLog.Multiline = True
+        textBoxLog.ScrollBars = ScrollBars.Vertical
+        textBoxLog.ReadOnly = True
+        leftPanel.Controls.Add(textBoxLog)
+        middleSplit.Panel1.Controls.Add(leftPanel)
+
+        ReDim dgvCh(MaxSensors - 1)
+
+
+        ' Right: four DataGridViews horizontally
+        rightTablesLayout.Dock = DockStyle.Fill
+        rightTablesLayout.ColumnCount = ActiveChannels
+        rightTablesLayout.RowCount = 1
+        For i As Integer = 0 To ActiveChannels - 1
+            rightTablesLayout.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F / ActiveChannels))
+        Next
+
+        ' Create DataGridViews
+        For ch As Integer = 0 To ActiveChannels - 1
+            Dim dgv As New DataGridView()
+            dgv.Dock = DockStyle.Fill
+            dgv.ReadOnly = True
+            dgv.AllowUserToAddRows = False
+            dgv.AllowUserToDeleteRows = False
+
+            dgv.RowHeadersVisible = False
+            dgv.SelectionMode = DataGridViewSelectionMode.FullRowSelect
+            dgv.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+            dgv.ColumnCount = 3
+            dgv.Columns(0).Name = "Index"
+            dgv.Columns(1).Name = "Value"
+            dgv.Columns(2).Name = "Delta"
+
+
+            ' header text like "CH0"
+            dgv.TopLeftHeaderCell.Value = $"CH{ch}"
+
+            ' style header background color to match channel color
+            Dim headerStyle As New DataGridViewCellStyle()
+            Select Case ch
+                Case 0
+                    headerStyle.BackColor = System.Drawing.Color.FromArgb(255, 200, 200)
+                Case 1
+                    headerStyle.BackColor = System.Drawing.Color.FromArgb(200, 255, 200)
+                Case 2
+                    headerStyle.BackColor = System.Drawing.Color.FromArgb(200, 200, 255)
+                Case 3
+                    headerStyle.BackColor = System.Drawing.Color.FromArgb(255, 230, 180)
+            End Select
+            dgv.ColumnHeadersDefaultCellStyle = headerStyle
+
+            dgvCh(ch) = dgv
+            rightTablesLayout.Controls.Add(dgv, ch, 0)
+        Next
+        For Each dgv In dgvCh
+            If dgv IsNot Nothing Then
+                dgv.DoubleBuffered(True)
+                dgv.EnableHeadersVisualStyles = False
+                dgv.SuspendLayout()
+            End If
+        Next
+
+        For ch As Integer = 0 To ActiveChannels - 1
+            Dim dgv = dgvCh(ch)
+            If dgv IsNot Nothing Then
+                AddHandler dgv.Scroll, AddressOf Dgv_Scroll
+            End If
+        Next
+
+        middleSplit.Panel2.Controls.Add(rightTablesLayout)
+        mainTable.Controls.Add(middleSplit, 0, 1)
+
+        ' --- Bottom: plot ---
+        formsPlot1.Dock = DockStyle.Fill
+        mainTable.Controls.Add(formsPlot1, 0, 2)
+
+        ' handle resize so splitter uses percent width
+        AddHandler Me.Resize, Sub(sender, e)
+                                  If Not Me.ClientSize.Width = 0 Then
+                                      middleSplit.SplitterDistance = CInt(Me.ClientSize.Width * 0.6)
+                                  End If
+                              End Sub
+    End Sub
+    Private Sub Dgv_Scroll(sender As Object, e As ScrollEventArgs)
+        ' If the user scrolls, stop auto-scrolling
+        If e.Type = ScrollEventType.ThumbTrack OrElse e.Type = ScrollEventType.EndScroll Then
+            autoScrollEnabled = False
+        End If
+    End Sub
+    Private Sub btnToggleGraph_Click(sender As Object, e As EventArgs)
+        ' 1. Flip the mode
+        isLinearMode = Not isLinearMode
+
+        ' 2. Re-run setup to clear the old graph and build the new one
+        SetupPlot()
+
+        ' 3. Log it
+        If isLinearMode Then
+            Log("Switched to Linear View (Value vs Time)")
+        Else
+            Log("Switched to Gaussian View (Spectrum)")
+        End If
+    End Sub
+    Private Sub SetupPlot()
+        If formsPlot1 Is Nothing Then Return
+
+        ' 1. Clear everything (remove old signals, lines, polygons)
+        formsPlot1.Plot.Clear()
+
+        ' Reset arrays to avoid null errors
+        ReDim plotSignals(ActiveChannels - 1)
+        ReDim plotLinearSignals(ActiveChannels - 1)
+        ReDim alarmPolygons(ActiveChannels - 1)
+        ReDim baseLines(ActiveChannels - 1)
+        ReDim moveLines(ActiveChannels - 1)
+
+        Dim colors() As SC = {
+            SC.FromHex("#FF0000"), SC.FromHex("#008000"),
+            SC.FromHex("#0000FF"), SC.FromHex("#FFA500"),
+            SC.FromHex("#800080"), SC.FromHex("#00FFFF"),
+            SC.FromHex("#FFC0CB"), SC.FromHex("#A52A2A")
+        }
+
+        ' =========================================================
+        ' MODE A: LINEAR VIEW (Value vs Time)
+        ' =========================================================
+        If isLinearMode Then
+            ' Reset Axes to standard numeric
+            formsPlot1.Plot.Axes.Bottom.TickGenerator = New ScottPlot.TickGenerators.NumericAutomatic()
+
+            ' Add signals linked to plotData (the history buffer)
+            For ch As Integer = 0 To ActiveChannels - 1
+                ' Ensure data exists
+                If plotData(ch) Is Nothing Then plotData(ch) = New Double(MaxPlotPoints - 1) {}
+
+                plotLinearSignals(ch) = formsPlot1.Plot.Add.Signal(plotData(ch))
+                plotLinearSignals(ch).Color = colors(ch)
+                plotLinearSignals(ch).LineWidth = 1.5
+            Next
+
+            ' Setup Limits
+            formsPlot1.Plot.Axes.SetLimitsX(0, MaxPlotPoints)
+            formsPlot1.Plot.Axes.AutoScaleY() ' Let Y scale automatically to values
+
+            ' Show Left Axis Ticks for values
+            formsPlot1.Plot.Axes.Left.TickLabelStyle.IsVisible = True
+            formsPlot1.Plot.Axes.Left.MajorTickStyle.Length = 5
+
+            ' =========================================================
+            ' MODE B: GAUSSIAN VIEW (Spectrum)
+            ' =========================================================
+        Else
+            Dim lightRedFill As ScottPlot.Color = ScottPlot.Colors.Red.WithAlpha(100)
+            Dim laneWidth As Integer = SpectrumLength / ActiveChannels
+            Dim customTicks As New List(Of ScottPlot.Tick)()
+
+            For ch As Integer = 0 To ActiveChannels - 1
+                If spectrumData(ch) Is Nothing OrElse spectrumData(ch).Length <> SpectrumLength Then
+                    spectrumData(ch) = New Double(SpectrumLength - 1) {}
+                End If
+
+                ' 1. Add Signal linked to spectrumData
+                plotSignals(ch) = formsPlot1.Plot.Add.Signal(spectrumData(ch))
+                plotSignals(ch).Color = colors(ch)
+                plotSignals(ch).LineWidth = 2
+
+                ' 2. Add Invisible Polygon for Alarm Fill
+                Dim dummyPoints() As ScottPlot.Coordinates = {New ScottPlot.Coordinates(0, 0)}
+                alarmPolygons(ch) = formsPlot1.Plot.Add.Polygon(dummyPoints)
+                alarmPolygons(ch).FillStyle.Color = lightRedFill
+                alarmPolygons(ch).LineStyle.Width = 0
+                alarmPolygons(ch).IsVisible = False
+
+                ' 3. Add Lines
+                baseLines(ch) = formsPlot1.Plot.Add.VerticalLine(0)
+                baseLines(ch).Color = colors(ch)
+                baseLines(ch).LineWidth = 2
+                baseLines(ch).LinePattern = ScottPlot.LinePattern.Dotted
+
+                moveLines(ch) = formsPlot1.Plot.Add.VerticalLine(0)
+                moveLines(ch).Color = SC.FromHex("#000000")
+                moveLines(ch).LineWidth = 1
+
+                ' Labels
+                Dim tickPosition As Double = (ch * laneWidth) + (laneWidth / 2)
+                Dim labelText As String = ""
+
+                Select Case ch
+                    Case 0 : labelText = "1540 nm"
+                    Case 1 : labelText = "1544 nm"
+                    Case 2 : labelText = "1548 nm"
+                    Case 3 : labelText = "1552 nm"
+                    Case 4 : labelText = "5555 nm"
+                    Case 5 : labelText = "6666 nm"
+                    Case 6 : labelText = "7777 nm"
+                    Case 7 : labelText = "8888 nm"
+                End Select
+
+                customTicks.Add(New ScottPlot.Tick(tickPosition, labelText))
+            Next
+
+            ' Apply Labels
+            formsPlot1.Plot.Axes.Bottom.TickGenerator = New ScottPlot.TickGenerators.NumericManual(customTicks.ToArray())
+            formsPlot1.Plot.Axes.SetLimitsX(0, SpectrumLength)
+            formsPlot1.Plot.Axes.SetLimitsY(0, 1.2)
+
+            ' Hide Left Axis Ticks
+            formsPlot1.Plot.Axes.Left.TickLabelStyle.IsVisible = False
+            formsPlot1.Plot.Axes.Left.MajorTickStyle.Length = 0
+        End If
+
+        formsPlot1.Refresh()
+    End Sub
+
+    Private Sub RefreshComPorts()
+        comboBoxPorts.Items.Clear()
+        comboBoxPorts.Items.AddRange(SerialPort.GetPortNames())
+        If comboBoxPorts.Items.Count > 0 Then comboBoxPorts.SelectedIndex = 0
+    End Sub
+
+    ' ---------- Serial connect / receive ----------
+    Private Sub btnConnect_Click(sender As Object, e As EventArgs)
+        If comboBoxPorts.SelectedItem Is Nothing Then
+            MessageBox.Show("Select COM port first.")
+            Return
+        End If
+        ConnectSerial(comboBoxPorts.SelectedItem.ToString())
+    End Sub
+
+    Private Sub ConnectSerial(portName As String, Optional baudRate As Integer = 250000)
+        Try
+            If serialPort IsNot Nothing AndAlso serialPort.IsOpen Then
+                serialPort.Close()
+            End If
+            serialPort = New SerialPort(portName, baudRate)
+            serialPort.NewLine = vbLf
+            AddHandler serialPort.DataReceived, AddressOf SerialPort_DataReceived
+            ' --- Toggle DTR to reset Arduino automatically ---
+            serialPort.DtrEnable = True
+            serialPort.Open()
+            serialPort.DtrEnable = False          ' Briefly low
+            Threading.Thread.Sleep(120)           ' Wait for Arduino to reset
+            serialPort.DtrEnable = True           ' High again
+
+            Log($"Connected and Arduino set on {portName}")
+        Catch ex As Exception
+            MessageBox.Show("Open port failed: " & ex.Message)
+        End Try
+    End Sub
+
+    Private Sub SerialPort_DataReceived(sender As Object, e As SerialDataReceivedEventArgs)
+        Try
+            Dim incoming As String = serialPort.ReadExisting()
+            serialBuffer &= incoming
+
+            ' Split into lines
+            Dim lines() As String = serialBuffer.Split({vbLf}, StringSplitOptions.None)
+
+            ' Keep the last incomplete line in buffer
+            serialBuffer = lines.Last()
+
+            ' Process all complete lines
+            For i As Integer = 0 To lines.Length - 2
+                Dim line = lines(i).Trim()
+                If line.Length > 0 Then
+                    SyncLock readQueue
+                        readQueue.Enqueue(line)
+                    End SyncLock
+                End If
+            Next
+
+        Catch ex As Exception
+            ' ignore read errors
+            Log($"Data recieved error in reading:" & ex.Message)
+        End Try
+    End Sub
+
+
+
+
+    Private Sub ProcessData()
+        If processQueue.Count = 0 Then Exit Sub
+
+        SyncLock processQueue
+            While processQueue.Count > 0
+                Dim parts = processQueue.Dequeue()
+
+                If parts.Length < ActiveChannels Then Continue While
+
+                tempData.Index = currentIndex
+                currentIndex += 1
+
+                'Dim thresholdPercent As Double = 0.05
+                ' Use the user-selected threshold from NumericUpDown
+                Dim thresholdPercent As Double = nudThreshold.Value / 100D
+
+
+                For ch As Integer = 0 To ActiveChannels - 1
+                    Dim currentVal = parts(ch)
+                    If Not baselineSet Then baseline(ch) = currentVal
+                    Dim delta = currentVal - baseline(ch)
+                    Dim deltaPercent As Double = Math.Abs(delta) / baseline(ch)
+
+
+
+                    ' --- Fill tempData ---
+                    Select Case ch
+                        Case 0
+                            tempData.Ch0_Val = currentVal
+                            tempData.Ch0_Delta = delta
+                        Case 1
+                            tempData.Ch1_Val = currentVal
+                            tempData.Ch1_Delta = delta
+                        Case 2
+                            tempData.Ch2_Val = currentVal
+                            tempData.Ch2_Delta = delta
+                        Case 3
+                            tempData.Ch3_Val = currentVal
+                            tempData.Ch3_Delta = delta
+                    End Select
+
+                    ' --- Update plot buffer ---
+                    Array.Copy(plotData(ch), 1, plotData(ch), 0, MaxPlotPoints - 1)
+                    plotData(ch)(MaxPlotPoints - 1) = currentVal
+                Next
+
+                ' Add snapshot to table buffer
+                SyncLock tableBuffer
+                    tableBuffer.Add(tempData.Clone())
+                End SyncLock
+            End While
+        End SyncLock
+    End Sub
+
+
+    ' ---------- Commands ----------
+    Private Sub SendCommand(cmd As String)
+        If serialPort IsNot Nothing AndAlso serialPort.IsOpen Then
+            If cmd = "RESET" Then
+                ResetArduino()
+            Else
+                Try
+                    serialPort.WriteLine(cmd)
+                    Log($"Sent command: {cmd}")
+                Catch ex As Exception
+                    Log($"Send failed: {ex.Message}")
+                End Try
+            End If
+        Else
+            Log("Serial port not connected. Cannot send command.")
+        End If
+    End Sub
+
+    Private Sub ResetArduino()
+        ' Ask user first
+        Dim result = MessageBox.Show("Do you want to clear the whole screen and reset Arduino?",
+                                 "Confirm Reset", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
+        If result <> DialogResult.Yes Then Return ' Cancel if user selects No
+
+        ' --- Clear DataGridViews ---
+        For Each dgv In dgvCh
+            If dgv IsNot Nothing Then dgv.Rows.Clear()
+        Next
+
+        ' --- Clear plot ---
+        If formsPlot1 IsNot Nothing Then
+            formsPlot1.Plot.Clear()
+        End If
+
+        ' --- Clear log ---
+        If textBoxLog IsNot Nothing Then
+            textBoxLog.Clear()
+        End If
+
+        ' --- Reset internal variables ---
+        currentIndex = 1
+        dataList.Clear()
+        tableBuffer.Clear()
+        baselineReady = False
+        waitingForBaseline = False
+        baselineCollectCount = 0
+        baselineSet = False
+
+        For ch As Integer = 0 To MaxSensors - 1
+            plotData(ch) = New Double(MaxPlotPoints - 1) {}
+            plotFlags(ch) = New Boolean(MaxPlotPoints - 1) {}
+            chInDisturbance(ch) = False
+            'chWidthCounter(ch) = 0
+            'chFromLastCounter(ch) = 0
+            'chLastDisturbanceIndex(ch) = 0
+            baseline(ch) = 0
+        Next
+
+        ' --- Recreate plot signals ---
+        SetupPlot()
+
+        ' --- Reset Arduino hardware ---
+        If serialPort IsNot Nothing AndAlso serialPort.IsOpen Then
+            Try
+                serialPort.DtrEnable = False
+                Threading.Thread.Sleep(120)
+                serialPort.DtrEnable = True
+                Log("Arduino reset (DTR toggle)")
+            Catch ex As Exception
+                Log("Reset failed: " & ex.Message)
+            End Try
+        End If
+    End Sub
+
+
+    Private Sub txtCommand_KeyDown(sender As Object, e As KeyEventArgs)
+        If e.KeyCode = Keys.Enter Then
+            e.SuppressKeyPress = True
+            Dim cmd = txtCommand.Text.Trim().ToUpper()
+            txtCommand.Clear()
+            txtCommand.Focus()
+            If cmd.Length > 0 Then
+                SendCommand(cmd)
+                If cmd = "G" Then
+                    waitingForBaseline = True
+                    baselineCollectCount = 0
+                    baselineReady = False
+                    Log("Waiting for baseline values from Arduino...")
+                End If
+            End If
+        End If
+    End Sub
+
+    ' ---------- Processing queue (UI thread) ----------
+    Private frameCounter As Integer = 0
+
+    Private Sub TimerPlot_Tick(sender As Object, e As EventArgs)
+        ' Process all lines from the queue
+        SyncLock readQueue
+            While readQueue.Count > 0
+                Dim line = readQueue.Dequeue()
+                ParseLine(line)
+            End While
+        End SyncLock
+
+        ' Update the plot
+        UpdatePlot()
+
+        ' Update tables every 5 ticks
+        frameCounter += 1
+        If frameCounter Mod 5 = 0 Then
+            UpdateTables()
+        End If
+    End Sub
+
+
+
+    ' --- Smoothly update DataGridViews ---
+    Private Sub UpdateTables()
+        If Me.InvokeRequired Then
+            Me.Invoke(Sub() UpdateTables())
+            Return
+        End If
+
+        SyncLock tableBuffer
+            ' Prepare new rows for each channel
+            For ch As Integer = 0 To ActiveChannels - 1
+                Dim dgv = dgvCh(ch)
+                If dgv Is Nothing Then Continue For
+                If tableBuffer.Count = 0 Then Continue For
+
+                dgv.SuspendLayout() ' suspend layout to reduce flicker
+
+                ' Build all new rows for this channel
+                Dim newRows As New List(Of Object())
+                For Each row In tableBuffer
+                    Dim valList As Object()
+                    Select Case ch
+                        Case 0
+                            valList = {row.Index, row.Ch0_Val, row.Ch0_Delta}
+                        Case 1
+                            valList = {row.Index, row.Ch1_Val, row.Ch1_Delta}
+                        Case 2
+                            valList = {row.Index, row.Ch2_Val, row.Ch2_Delta}
+                        Case 3
+                            valList = {row.Index, row.Ch3_Val, row.Ch3_Delta
+                                   }
+                        Case Else
+                            Continue For
+                    End Select
+                    newRows.Add(valList)
+                Next
+
+                ' Add all rows at once
+                For Each r In newRows
+                    dgv.Rows.Add(r)
+                Next
+
+                ' Keep only last MaxPlotPoints rows
+                While dgv.Rows.Count > MaxPlotPoints
+                    dgv.Rows.RemoveAt(0)
+                End While
+
+                ' Schedule smooth scroll
+                pendingScrollIndex(ch) = dgv.Rows.Count - 1
+
+                dgv.ResumeLayout(False) ' resume layout
+            Next
+
+            tableBuffer.Clear()
+        End SyncLock
+    End Sub
+
+    ' --- Smooth scrolling timer ---
+    Private Sub TimerTableScroll_Tick(sender As Object, e As EventArgs) Handles TimerTableScroll.Tick
+        If Not autoScrollEnabled Then Return ' skip auto-scroll if user scrolled manually
+
+        Const maxStep As Integer = 4
+        Const minStep As Integer = 1
+        Const minInterval As Integer = 16
+        Const maxInterval As Integer = 100
+
+        For ch As Integer = 0 To ActiveChannels - 1
+            Dim dgv = dgvCh(ch)
+            If dgv Is Nothing OrElse dgv.Rows.Count = 0 Then Continue For
+
+            Dim target = pendingScrollIndex(ch)
+            If target = -1 Then Continue For
+
+            Try
+                Dim current = dgv.FirstDisplayedScrollingRowIndex
+                If current < 0 Then current = 0
+
+                Dim distance As Integer = Math.Abs(target - current)
+
+                Dim stepSize As Integer
+                If distance >= 10 Then
+                    stepSize = maxStep
+                ElseIf distance >= 3 Then
+                    stepSize = 2
+                Else
+                    stepSize = minStep
+                End If
+
+                If target > current Then
+                    dgv.FirstDisplayedScrollingRowIndex = Math.Min(current + stepSize, target)
+                ElseIf target < current Then
+                    dgv.FirstDisplayedScrollingRowIndex = Math.Max(current - stepSize, target)
+                Else
+                    pendingScrollIndex(ch) = -1
+                End If
+
+                ' Optional: slow down timer if very close
+                Dim newInterval As Integer = minInterval + (distance * 5)
+                TimerTableScroll.Interval = Math.Min(maxInterval, Math.Max(minInterval, newInterval))
+
+            Catch
+            End Try
+        Next
+    End Sub
+
+
+    Private Sub StyleTables()
+        For Each dgv In dgvCh
+            If dgv Is Nothing Then Continue For
+            dgv.EnableHeadersVisualStyles = False
+            dgv.RowHeadersVisible = False
+            dgv.DefaultCellStyle.SelectionBackColor = dgv.DefaultCellStyle.BackColor
+            dgv.DefaultCellStyle.SelectionForeColor = dgv.DefaultCellStyle.ForeColor
+            dgv.DefaultCellStyle.Font = New Font("Segoe UI", 9)
+            'dgv.GridColor = Color.FromARGB(255, 220, 220, 220)
+            dgv.DoubleBuffered(True)
+        Next
+    End Sub
+
+
+
+
+    ' ---------- Main parsing ----------
+    Private Sub ParseLine(line As String)
+        Try
+            line = line.Trim()
+            If line.Length = 0 Then Return
+
+            ' --- 1. Log non-data lines ---
+            If Not (line.StartsWith("[") AndAlso line.EndsWith("]")) Then
+                Log(line)
+            End If
+
+            ' --- 2. Detect Active Sensors ---
+            If line.Contains("Sensors:") OrElse line.Contains("Total peaks found:") Then
+                ' Example: "Sensors: 4"
+                Dim parts = line.Split(":"c)
+                Dim found As Integer
+                If parts.Length > 1 AndAlso Integer.TryParse(parts(1).Trim(), found) Then
+                    If found > 0 AndAlso found <= MaxSensors AndAlso found <> ActiveChannels Then
+                        ActiveChannels = found
+                        Log($"Configured for {ActiveChannels} sensors.")
+                        ' Reset buffers for new channel count
+                        ResetBuffers()
+                    End If
+                End If
+            End If
+
+            ' --- 3. Capture Baseline (New Text Format) ---
+            ' Arduino sends: "Ch1 Base: 1234"
+            If line.Contains("Base:") Then
+                Try
+                    ' Split by space
+                    Dim parts = line.Split(" "c)
+                    ' parts(0)="Ch1", parts(1)="Base:", parts(2)="1234"
+
+                    ' Parse Channel Number (e.g. "Ch1" -> 0)
+                    Dim chStr = parts(0).Replace("Ch", "").Trim()
+                    Dim chIndex As Integer = Integer.Parse(chStr) - 1
+
+                    ' Parse Value
+                    Dim valStr = parts.Last().Trim()
+                    Dim val As Integer = Integer.Parse(valStr)
+
+                    If chIndex >= 0 AndAlso chIndex < MaxSensors Then
+                        baseline(chIndex) = val
+                        baselineSet = True ' We have at least one baseline
+                        Log($"Captured Baseline Ch{chIndex + 1}: {val}")
+                    End If
+                Catch ex As Exception
+                    Log("Error parsing baseline: " & ex.Message)
+                End Try
+            End If
+
+            ' --- 4. Process Data Stream [100, 200, ...] ---
+            If line.StartsWith("[") AndAlso line.EndsWith("]") Then
+                Dim raw = line.Trim("["c, "]"c)
+                Dim rawParts = raw.Split(","c)
+
+                ' Parse into Long array
+                Dim parts(rawParts.Length - 1) As Long
+                Dim valid As Boolean = True
+
+                For i As Integer = 0 To rawParts.Length - 1
+                    If Not Long.TryParse(rawParts(i).Trim(), parts(i)) Then
+                        valid = False
+                        Exit For
+                    End If
+                Next
+
+                If valid AndAlso parts.Length >= ActiveChannels Then
+                    ' Add to processing queue (or process directly)
+                    tempData.Index = currentIndex
+                    currentIndex += 1
+
+                    ' Process logic (Calculates Deltas, etc.)
+                    ProcessIncomingData(parts)
+                End If
+            End If
+
+        Catch ex As Exception
+            ' Log("Parse error: " & ex.Message)
+        End Try
+    End Sub
+    ' Helper to reset arrays when sensor count changes
+    Private Sub ResetBuffers()
+        ReDim plotData(MaxSensors - 1)
+        ReDim plotFlags(MaxSensors - 1)
+        ReDim baseline(MaxSensors - 1)
+
+        For i As Integer = 0 To MaxSensors - 1
+            plotData(i) = New Double(MaxPlotPoints - 1) {}
+            plotFlags(i) = New Boolean(MaxPlotPoints - 1) {}
+        Next
+
+        ' Re-init the plot
+        SetupPlot()
+        ' Clear tables
+        For Each dgv In dgvCh
+            If dgv IsNot Nothing Then dgv.Rows.Clear()
+        Next
+    End Sub
+
+    ' Helper to handle the math (Thresholds, Deltas, and Wavelengths)
+    Private Sub ProcessIncomingData(parts() As Long)
+        ' This sub should use Long for parts, but since FbgData uses Integer for Val/Delta, 
+        ' we will stick to Integer for now to match the user's FbgData definition.
+        Dim thresholdPercent As Double = nudThreshold.Value / 100D
+
+        For ch As Integer = 0 To ActiveChannels - 1
+            ' Use Integer to match FbgData definition
+            Dim currentVal As Integer = CInt(parts(ch))
+
+            If baseline(ch) = 0 Then baseline(ch) = currentVal
+
+            ' --- UPDATED DELTA LOGIC ---
+            ' Since stress DECREASES ADC, we flip the subtraction:
+            ' When currentVal < baseline, delta becomes POSITIVE.
+            Dim delta As Integer = baseline(ch) - currentVal
+
+            ' --- WAVELENGTH CALCULATION ---
+            ' Now, as ADC drops, delta is positive, so currentWavelength INCREASES.
+            Dim deltaLambda As Double = CDbl(delta) * NM_PER_ADC_STEP
+            Dim currentWavelength As Double = FBG_WAVELENGTHS(ch) + deltaLambda
+
+            ' --- FREQUENCY CALCULATION ---
+            ' Frequency will naturally decrease as wavelength increases (Physically correct)
+            Dim currentWavelengthMeters As Double = currentWavelength * 0.000000001
+            Dim currentFrequencyTHz As Double = (SPEED_OF_LIGHT_M_PER_S / currentWavelengthMeters) / 1000000000000.0
+            ' ------------------------------------
+
+            Dim deltaPercent As Double = 0
+            If baseline(ch) <> 0 Then deltaPercent = Math.Abs(CDbl(delta)) / baseline(ch)
+
+            ' --- Disturbance Logic ---
+            If deltaPercent >= thresholdPercent Then
+                chInDisturbance(ch) = True
+                chWidthCounter(ch) += 1
+                chFromLastCounter(ch) = 0
+            Else
+                If chInDisturbance(ch) Then
+                    chInDisturbance(ch) = False
+                    chWidthCounter(ch) = 0
+                    chFromLastCounter(ch) = 1
+                Else
+                    If chFromLastCounter(ch) > 0 Then chFromLastCounter(ch) += 1
+                End If
+            End If
+
+            ' --- Fill Object ---
+            Select Case ch
+                Case 0
+                    tempData.Ch0_Val = currentVal
+                    tempData.Ch0_Delta = delta
+                    tempData.Ch0_DeltaNm = deltaLambda      ' <<< NEW
+                    tempData.Ch0_Wavelength = currentWavelength ' <<< NEW
+                    tempData.Ch0_Frequency = currentFrequencyTHz
+
+                Case 1
+                    tempData.Ch1_Val = currentVal
+                    tempData.Ch1_Delta = delta
+                    tempData.Ch1_DeltaNm = deltaLambda      ' <<< NEW
+                    tempData.Ch1_Wavelength = currentWavelength ' <<< NEW
+                    tempData.Ch1_Frequency = currentFrequencyTHz
+
+                Case 2
+                    tempData.Ch2_Val = currentVal
+                    tempData.Ch2_Delta = delta
+                    tempData.Ch2_DeltaNm = deltaLambda      ' <<< NEW
+                    tempData.Ch2_Wavelength = currentWavelength ' <<< NEW
+                    tempData.Ch2_Frequency = currentFrequencyTHz
+
+                Case 3
+                    tempData.Ch3_Val = currentVal
+                    tempData.Ch3_Delta = delta
+                    tempData.Ch3_DeltaNm = deltaLambda      ' <<< NEW
+                    tempData.Ch3_Wavelength = currentWavelength ' <<< NEW
+                    tempData.Ch3_Frequency = currentFrequencyTHz
+
+                Case 4
+                    tempData.Ch4_Val = currentVal
+                    tempData.Ch4_Delta = delta
+                    tempData.Ch4_DeltaNm = deltaLambda      ' <<< NEW
+                    tempData.Ch4_Wavelength = currentWavelength ' <<< NEW
+                    tempData.Ch4_Frequency = currentFrequencyTHz
+
+                Case 5
+                    tempData.Ch5_Val = currentVal
+                    tempData.Ch5_Delta = delta
+                    tempData.Ch5_DeltaNm = deltaLambda      ' <<< NEW
+                    tempData.Ch5_Wavelength = currentWavelength ' <<< NEW
+                    tempData.Ch5_Frequency = currentFrequencyTHz
+
+                Case 6
+                    tempData.Ch6_Val = currentVal
+                    tempData.Ch6_Delta = delta
+                    tempData.Ch6_DeltaNm = deltaLambda      ' <<< NEW
+                    tempData.Ch6_Wavelength = currentWavelength ' <<< NEW
+                    tempData.Ch6_Frequency = currentFrequencyTHz
+
+                Case 7
+                    tempData.Ch7_Val = currentVal
+                    tempData.Ch7_Delta = delta
+                    tempData.Ch7_DeltaNm = deltaLambda      ' <<< NEW
+                    tempData.Ch7_Wavelength = currentWavelength ' <<< NEW
+                    tempData.Ch7_Frequency = currentFrequencyTHz
+
+            End Select
+
+            ' --- Update Plot Buffer (Shift Left) ---
+            ' If plotting in Wavelength Mode (not linear ADC mode), use DeltaLambda for the plot.
+            If Not isLinearMode Then
+                Array.Copy(plotData(ch), 1, plotData(ch), 0, MaxPlotPoints - 1)
+                ' Use DeltaLambda (nm shift) for plotting in Gaussian (spectral tracking) mode
+                plotData(ch)(MaxPlotPoints - 1) = deltaLambda
+            Else
+                ' Use raw ADC value for plotting in Linear (time series) mode
+                Array.Copy(plotData(ch), 1, plotData(ch), 0, MaxPlotPoints - 1)
+                plotData(ch)(MaxPlotPoints - 1) = currentVal
+            End If
+
+        Next
+
+        ' --- Add to Data Lists ---
+        Dim newData = tempData.Clone()
+        dataList.Add(newData)
+
+        SyncLock tableBuffer
+            tableBuffer.Add(newData)
+        End SyncLock
+    End Sub
+
+
+    Private Sub AppendRowToChannelTables(row As FbgData)
+        SyncLock tableBuffer
+            tableBuffer.Add(row)
+        End SyncLock
+    End Sub
+    Private Sub SetupGaussianPlotAxis()
+        formsPlot1.Plot.Title("Wavelength Shift Monitoring")
+
+        Dim xAxis = formsPlot1.Plot.Axes.Bottom
+        Dim yAxis = formsPlot1.Plot.Axes.Left
+
+        yAxis.Label.Text = "Intensity (Arbitrary Units)"
+        xAxis.Label.Text = "Wavelength (nm)"
+
+        ' STANDARD ORIENTATION: 0 on Left, SpectrumLength on Right
+        ' Higher nm will naturally be on the right.
+        formsPlot1.Plot.Axes.SetLimits(
+        left:=0,
+        right:=SpectrumLength,
+        bottom:=0,
+        top:=2.5)
+
+        ' --- Manual ticks ---
+        Dim tickPos As New List(Of Double)
+        Dim tickLab As New List(Of String)
+
+        For px As Integer = 0 To SpectrumLength Step 50
+            Dim wl = PLOT_MIN_WAVELENGTH + (px / PIXELS_PER_NM)
+            tickPos.Add(px)
+            tickLab.Add(wl.ToString("F1") & " nm")
+        Next
+
+        xAxis.TickGenerator = New ScottPlot.TickGenerators.NumericManual(tickPos.ToArray(), tickLab.ToArray())
+
+        formsPlot1.Refresh()
+    End Sub
+    ' ---------- Plot ---------- 
+    ' -------------------------------------------------------------
+    ' SENSITIVITY CONFIGURATION
+    ' -------------------------------------------------------------
+    ' If your values change by 100s or 1000s, increase this number (e.g. 10.0 or 100.0)
+    ' to shrink the movement so it stays on screen.
+    ' If values change by 1s or 5s, keep it at 1.0.
+    Private Const MovementSensitivity As Double = 1.0
+    ' ---------------------------------------------------------
+    ' SMOOTHING CONFIGURATION
+    ' ---------------------------------------------------------
+    ' Controls how much we "trust" the new value vs the old average.
+    ' 0.1 = Very Smooth (Less fluctuation, slight lag)
+    ' 0.5 = Balanced
+    ' 0.9 = No Smoothing (High fluctuation, instant response)
+    Private Const SmoothingFactor As Double = 0.03
+
+    ' Array to store the running average for each sensor
+    Private smoothedValues(MaxSensors - 1) As Double
+    ' --- CLASS-LEVEL VARIABLES/CONSTANTS ---
+    Private Const MAX_ADC_VALUE As Double = 80000.0 ' Adjust this value to your sensor's max ADC reading
+    Private plotLabels() As Plottables.Text ' Array to hold the floating frequency labels
+
+    ' Ensure this is initialized with the other arrays in your Form_Load or constructor
+    ' plotLabels = New ScottPlot.Plottables.Text(ActiveChannels - 1) {}
+    Private Sub UpdatePlot()
+        ' --- 1. HANDLING LINEAR MODE ---
+        If isLinearMode Then
+            Dim xOffset As Double = currentIndex - MaxPlotPoints
+            For ch As Integer = 0 To ActiveChannels - 1
+                If plotLinearSignals(ch) IsNot Nothing Then
+                    plotLinearSignals(ch).Data.XOffset = xOffset
+                End If
+            Next
+            formsPlot1.Plot.Axes.SetLimitsX(xOffset, currentIndex)
+            formsPlot1.Plot.Axes.AutoScaleY()
+            formsPlot1.Refresh()
+            Exit Sub
+        End If
+
+        ' --- 2. GAUSSIAN MODE ---
+        If plotSignals Is Nothing OrElse plotSignals.Length = 0 Then Exit Sub
+
+        ' Get Latest Data
+        Dim latestData As FbgData = Nothing
+        SyncLock tableBuffer
+            If tableBuffer.Count > 0 Then latestData = tableBuffer.Last().Clone()
+        End SyncLock
+
+        If latestData Is Nothing Then Exit Sub
+
+        Dim userThresholdPercent As Double = nudThreshold.Value / 100.0
+        Dim laneWidth As Integer = SpectrumLength / ActiveChannels
+
+        ' =========================================================
+        ' NEW MATH: Dynamic Sensitivity Calculation (Existing Logic)
+        ' =========================================================
+        Dim dynamicSensitivity As Double = PhysicalWakeUpDelta / laneWidth
+
+        ' Colors
+        Dim defaultColors() As ScottPlot.Color = {
+        SC.FromHex("#FF0000"), SC.FromHex("#008000"),
+        SC.FromHex("#0000FF"), SC.FromHex("#FFA500"),
+        SC.FromHex("#800080"), SC.FromHex("#00FFFF"),
+        SC.FromHex("#FFC0CB"), SC.FromHex("#A52A2A")
+    }
+        Dim lightRedFill As ScottPlot.Color = ScottPlot.Colors.Red.WithAlpha(100)
+
+        For ch As Integer = 0 To ActiveChannels - 1
+            Array.Clear(spectrumData(ch), 0, spectrumData(ch).Length)
+
+            ' ---------------------------------------------------------
+            ' STEP 1: GET RAW VALUE & NEW DATA (Intensity and Frequency)
+            ' ---------------------------------------------------------
+            Dim rawInput As Integer = 0
+            Dim currentFrequencyTHz As Double = 0.0 ' Initialize for new data
+            Dim intensityScale As Double = 1.0     ' Default scale
+            Dim currentWavelength As Double = 0.0
+            Select Case ch
+                Case 0
+                    rawInput = latestData.Ch0_Val
+                    'currentFrequencyTHz = latestData.Ch0_Frequency
+                    currentWavelength = latestData.Ch0_Wavelength
+                Case 1
+                    rawInput = latestData.Ch1_Val
+                    'currentFrequencyTHz = latestData.Ch1_Frequency
+                    currentWavelength = latestData.Ch1_Wavelength
+                Case 2
+                    rawInput = latestData.Ch2_Val
+                    'currentFrequencyTHz = latestData.Ch2_Frequency
+                    currentWavelength = latestData.Ch2_Wavelength
+                Case 3
+                    rawInput = latestData.Ch3_Val
+                    'currentFrequencyTHz = latestData.Ch3_Frequency
+                    currentWavelength = latestData.Ch3_Wavelength
+                Case 4
+                    rawInput = latestData.Ch4_Val
+                    'currentFrequencyTHz = latestData.Ch4_Frequency
+                    currentWavelength = latestData.Ch4_Wavelength
+                Case 5
+                    rawInput = latestData.Ch5_Val
+                    'currentFrequencyTHz = latestData.Ch5_Frequency
+                    currentWavelength = latestData.Ch5_Wavelength
+                Case 6
+                    rawInput = latestData.Ch6_Val
+                    'currentFrequencyTHz = latestData.Ch6_Frequency
+                    currentWavelength = latestData.Ch6_Wavelength
+                Case 7
+                    rawInput = latestData.Ch7_Val
+                    'currentFrequencyTHz = latestData.Ch7_Frequency
+                    currentWavelength = latestData.Ch7_Wavelength
+            End Select
+
+            ' Calculate the intensity scale for the Gaussian height (0.0 to 1.0)
+            ' Using the raw ADC value for height proportionality
+            intensityScale = CDbl(rawInput) / MAX_ADC_VALUE
+            If intensityScale > 1.0 Then intensityScale = 1.0 ' Cap at 1.0
+            ' ---------------------------------------------------------
+
+            ' ---------------------------------------------------------
+            ' STEP 2: APPLY SMOOTHING FILTER (Existing Logic)
+            ' ---------------------------------------------------------
+            If smoothedValues(ch) = 0 Then smoothedValues(ch) = rawInput
+            smoothedValues(ch) = (smoothedValues(ch) * (1.0 - SmoothingFactor)) + (rawInput * SmoothingFactor)
+            Dim stableVal As Integer = CInt(smoothedValues(ch))
+
+            ' ---------------------------------------------------------
+            ' PLOTTING LOGIC
+            ' ---------------------------------------------------------
+            Dim homePosition As Integer = (ch * laneWidth) + (laneWidth / 2)
+            Dim plotIndex As Integer
+
+            If Not baselineSet Then
+                plotIndex = homePosition
+                ' Reset appearance
+                plotSignals(ch).Color = defaultColors(ch)
+                plotSignals(ch).LineWidth = 2
+                If alarmPolygons(ch) IsNot Nothing Then
+                    formsPlot1.Plot.Remove(alarmPolygons(ch))
+                    alarmPolygons(ch) = Nothing
+                End If
+            Else
+                ' ---------------------------------------------------------
+                ' STEP 3: APPLY NOISE LOGIC (Bi-Directional)
+                ' ---------------------------------------------------------
+                ' ADC decreases -> rawDelta is Positive (Stress)
+                ' ADC increases -> rawDelta is Negative (Reverse/Release)
+                Dim rawDelta As Double = baseline(ch) - stableVal
+                Dim allowedNoise As Double = baseline(ch) * (NoisePercent / 100.0)
+
+                Dim effectiveDelta As Double = 0.0
+
+                ' Apply Deadband: Only move if the change is larger than the noise threshold
+                If Math.Abs(rawDelta) > allowedNoise Then
+                    ' Subtract the noise threshold from the magnitude to prevent "jumping"
+                    ' This keeps the movement smooth as it exits the deadband zone
+                    effectiveDelta = (Math.Abs(rawDelta) - allowedNoise) * Math.Sign(rawDelta)
+                End If
+
+                ' 1. Convert the signed ADC delta into a physical nm shift (can be + or -)
+                Dim deltaLambda As Double = effectiveDelta * NM_PER_ADC_STEP
+
+                ' 2. Convert to pixel displacement (Positive = Right, Negative = Left)
+                ' We no longer need a separate signOfShift variable because effectiveDelta carries the sign
+                Dim pixelShift As Integer = CInt(deltaLambda * PIXELS_PER_NM)
+
+                ' 3. Calculate final position relative to Home
+                plotIndex = homePosition + pixelShift
+
+
+                ' ---------------------------------------------------------
+                ' STEP 4: ALARM CHECK (Existing Logic)
+                ' ---------------------------------------------------------
+                Dim realPercentShift As Double = 0
+                If baseline(ch) <> 0 Then
+                    realPercentShift = Math.Abs(stableVal - baseline(ch)) / CDbl(baseline(ch))
+                End If
+
+                If alarmPolygons(ch) IsNot Nothing Then
+                    formsPlot1.Plot.Remove(alarmPolygons(ch))
+                    alarmPolygons(ch) = Nothing
+                End If
+
+                If realPercentShift >= userThresholdPercent Then
+                    ' ALARM ON
+                    plotSignals(ch).Color = ScottPlot.Colors.Red
+                    plotSignals(ch).LineWidth = 2
+
+                    If plotIndex < 0 Then plotIndex = 0
+                    If plotIndex > 255 Then plotIndex = 255
+
+                    ' Draw wave now so we can build the polygon - Must use the scaled DrawGaussian
+                    DrawGaussian(spectrumData(ch), plotIndex, intensityScale) ' <<< SCALED CALL
+
+
+                    Dim polyPoints As New List(Of ScottPlot.Coordinates)
+                    polyPoints.Add(New ScottPlot.Coordinates(0, 0))
+                    For x As Integer = 0 To SpectrumLength - 1
+                        ' Only include points that are part of the drawn Gaussian
+                        If spectrumData(ch)(x) > 0.001 Then
+                            polyPoints.Add(New ScottPlot.Coordinates(x, spectrumData(ch)(x)))
+                        End If
+                    Next
+                    polyPoints.Add(New ScottPlot.Coordinates(SpectrumLength - 1, 0))
+
+                    Dim newPoly = formsPlot1.Plot.Add.Polygon(polyPoints.ToArray())
+                    newPoly.FillStyle.Color = lightRedFill
+                    newPoly.LineStyle.Width = 0
+                    alarmPolygons(ch) = newPoly
+                Else
+                    ' ALARM OFF
+                    plotSignals(ch).Color = defaultColors(ch)
+                    plotSignals(ch).LineWidth = 2
+                End If
+            End If ' End If Not baselineSet
+
+            ' ---------------------------------------------------------
+            ' STEP 5: DRAW GAUSSIAN (Standard/Non-Alarm case)
+            ' ---------------------------------------------------------
+            If plotIndex < 0 Then plotIndex = 0
+            If plotIndex > 255 Then plotIndex = 255
+
+            ' Ensure DrawGaussian is called with the calculated intensity scale
+            DrawGaussian(spectrumData(ch), plotIndex, intensityScale) ' <<< SCALED CALL
+
+            ' ---------------------------------------------------------
+            ' STEP 6: FLOATING FREQUENCY TEXT (Final Corrected ScottPlot 5 Syntax)
+            ' ---------------------------------------------------------
+            'Dim freqText As String = $"{currentFrequencyTHz:F5} THz"
+
+            ' The Y-coordinate for the label is the peak height, scaled by intensityScale
+            'Const LABEL_Y_PEAK As Double = 2.0
+
+            'If plotLabels(ch) Is Nothing Then
+            ' Create new label
+            'plotLabels(ch) = formsPlot1.Plot.Add.Text(text:=freqText, x:=plotIndex, y:=LABEL_Y_PEAK * intensityScale)
+
+            ' FIX 1: Use LabelFontSize (as per obsolescence warning)
+            'plotLabels(ch).LabelFontSize = 10
+
+            ' FIX 2: Assuming Alignment is now LabelAlignment
+            'plotLabels(ch).LabelAlignment = ScottPlot.Alignment.LowerCenter
+
+            ' FIX 3: Assuming Text property is now LabelText
+            'plotLabels(ch).LabelText = freqText
+            'Else
+            ' Update existing label's properties
+
+            ' FIX 3: Use LabelText (to match the property name used in creation/update)
+            'plotLabels(ch).LabelText = freqText
+
+            ' Location update remains the same
+            'plotLabels(ch).Location = New ScottPlot.Coordinates(plotIndex, LABEL_Y_PEAK * intensityScale)
+
+            ' Re-apply properties if they were set globally in an earlier version
+            'plotLabels(ch).LabelFontSize = 10
+            'plotLabels(ch).LabelAlignment = ScottPlot.Alignment.LowerCenter
+            'End If
+
+
+
+            ' ---------------------------------------------------------
+            ' STEP 6: FLOATING WAVELENGTH TEXT (nm) - UPDATED
+            ' ---------------------------------------------------------
+            Dim nmText As String = $"{currentWavelength:F3} nm"
+
+            ' This must match the PEAK_HEIGHT inside DrawGaussian (which is 2.0)
+            Const WAVE_MAX_HEIGHT As Double = 2.0
+
+            ' Add a small offset (e.g., 0.1) so the text doesn't touch the peak
+            Dim textYPosition As Double = (WAVE_MAX_HEIGHT * intensityScale) + 0.1
+
+            If plotLabels(ch) Is Nothing Then
+                ' Create new label slightly above the peak
+                plotLabels(ch) = formsPlot1.Plot.Add.Text(text:=nmText, x:=plotIndex, y:=textYPosition)
+                plotLabels(ch).LabelFontSize = 20
+                plotLabels(ch).LabelAlignment = ScottPlot.Alignment.LowerCenter
+                ' Optional: Match text color to the channel color
+                plotLabels(ch).LabelFontColor = defaultColors(ch)
+            Else
+                ' Update existing label position and text
+                plotLabels(ch).LabelText = nmText
+                plotLabels(ch).Location = New ScottPlot.Coordinates(plotIndex, textYPosition)
+            End If
+
+            ' ---------------------------------------------------------
+
+
+            If baseLines(ch) IsNot Nothing AndAlso moveLines(ch) IsNot Nothing Then
+                baseLines(ch).X = homePosition
+                moveLines(ch).X = plotIndex
+            End If
+        Next
+
+        formsPlot1.Refresh()
+    End Sub
+
+
+    ' Helper Math Function (Make sure this exists in your class!)
+    ' This function draws a scaled Gaussian curve into the spectrumData array 
+    ' centered at plotIndex, with a peak height scaled by intensityScale.
+    Private Sub DrawGaussian(ByVal data() As Double, ByVal plotIndex As Integer, ByVal intensityScale As Double)
+
+        ' --- PARAMETERS ---
+        ' Define the shape of the Gaussian curve
+        Const HALF_WIDTH As Integer = 5   ' Half the distance (in pixels) the curve extends from the center
+        Const PEAK_HEIGHT As Double = 2.0 ' The maximum height of the Gaussian before scaling (max ADC height)
+        Const SIGMA As Double = 2.0        ' Standard deviation (controls the width/spread of the curve)
+
+        Dim spectrumLength As Integer = data.Length
+
+        ' Clear the array first (or it will draw over old data)
+        Array.Clear(data, 0, spectrumLength)
+
+        ' The center of the Gaussian (mu) is the plotIndex
+        Dim mu As Double = CDbl(plotIndex)
+
+        ' Calculate the actual amplitude based on intensity scale
+        ' The intensity scale should be between 0 and 1 (from UpdatePlot)
+        Dim actualAmplitude As Double = PEAK_HEIGHT * intensityScale
+
+        ' Calculate points around the center
+        For i As Integer = 0 To spectrumLength - 1
+
+            Dim diff As Double = CDbl(i) - mu
+
+            ' Check if the point is close enough to the center to calculate, 
+            ' otherwise the calculation is unnecessary (optimization)
+            If Math.Abs(diff) <= HALF_WIDTH Then
+
+                ' Gaussian Formula: f(x) = A * e^(-0.5 * ((x - mu) / sigma)^2)
+                Dim power As Double = -0.5 * (diff / SIGMA) ^ 2
+
+                ' Apply the actual scaled amplitude
+                data(i) = actualAmplitude * Math.Exp(power)
+
+                ' Boundary Check (Optional: Ensure points are non-negative)
+                If data(i) < 0 Then data(i) = 0
+            End If
+        Next
+
+    End Sub
+
+
+    ' ---------- Save Excel ----------
+    Private Sub btnSave_Click(sender As Object, e As EventArgs)
+        If dataList Is Nothing Then
+            Log("No data to save.")
+            Return
+        End If
+        If dataList.Count = 0 Then
+            Log("No data to save.")
+            Return
+        End If
+        Using sfd As New SaveFileDialog()
+            sfd.Filter = "CSV Files (*.csv)|*.csv|Excel Files (*.xlsx)|*.xlsx"
+
+            Dim timestamp As String = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss")
+
+            sfd.FileName = $"FBG_Data({timestamp})"
+
+            sfd.Title = "Save FBG Data"
+
+            If sfd.ShowDialog() = DialogResult.OK Then
+                Select Case sfd.FilterIndex
+                    Case 1  ' CSV
+                        SaveToCsv(sfd.FileName)
+
+                    Case 2  ' Excel
+                        SaveToExcel(sfd.FileName)
+                End Select
+            End If
+        End Using
+    End Sub
+
+    Private Sub SaveToCsv(filename As String)
+        Using sw As New StreamWriter(filename)
+            ' --- Build header dynamically ---
+            Dim header As New List(Of String)
+            header.Add("TimeStamp")
+            For ch As Integer = 0 To ActiveChannels - 1
+                header.Add($"Ch{ch}_Val")
+                header.Add($"Ch{ch}_Delta")
+                'header.Add($"Ch{ch}_Width")
+                'header.Add($"Ch{ch}_FromLast")
+            Next
+            sw.WriteLine(String.Join(",", header))
+
+            ' --- Write data rows dynamically ---
+            For Each row In dataList
+                Dim values As New List(Of String)
+                values.Add(row.Index.ToString())
+                For ch As Integer = 0 To ActiveChannels - 1
+                    Select Case ch
+                        Case 0
+                            values.Add(row.Ch0_Val.ToString())
+                            values.Add(row.Ch0_Delta.ToString())
+                            ' values.Add(row.Ch0_Width.ToString())
+                           ' values.Add(row.Ch0_FromLast.ToString())
+                        Case 1
+                            values.Add(row.Ch1_Val.ToString())
+                            values.Add(row.Ch1_Delta.ToString())
+                            ' values.Add(row.Ch1_Width.ToString())
+                            'values.Add(row.Ch1_FromLast.ToString())
+                        Case 2
+                            values.Add(row.Ch2_Val.ToString())
+                            values.Add(row.Ch2_Delta.ToString())
+                            'values.Add(row.Ch2_Width.ToString())
+                            'values.Add(row.Ch2_FromLast.ToString())
+                        Case 3
+                            values.Add(row.Ch3_Val.ToString())
+                            values.Add(row.Ch3_Delta.ToString())
+                            'values.Add(row.Ch3_Width.ToString())
+                            'values.Add(row.Ch3_FromLast.ToString())
+                        Case 4
+                            values.Add(row.Ch4_Val.ToString())
+                            values.Add(row.Ch4_Delta.ToString())
+                            'values.Add(row.Ch4_Width.ToString())
+                           ' values.Add(row.Ch4_FromLast.ToString())
+                        Case 5
+                            values.Add(row.Ch5_Val.ToString())
+                            values.Add(row.Ch5_Delta.ToString())
+                            'values.Add(row.Ch5_Width.ToString())
+                            'values.Add(row.Ch5_FromLast.ToString())
+                        Case 6
+                            values.Add(row.Ch6_Val.ToString())
+                            values.Add(row.Ch6_Delta.ToString())
+                            'values.Add(row.Ch6_Width.ToString())
+                            'values.Add(row.Ch6_FromLast.ToString())
+                        Case 7
+                            values.Add(row.Ch7_Val.ToString())
+                            values.Add(row.Ch7_Delta.ToString())
+                            'values.Add(row.Ch7_Width.ToString())
+                            'values.Add(row.Ch7_FromLast.ToString())
+                    End Select
+                Next
+                sw.WriteLine(String.Join(",", values))
+            Next
+        End Using
+        Log($"Data saved to {filename}")
+    End Sub
+
+    Private Sub SaveToExcel(filename As String)
+        Try
+            ' --- Delete file if it already exists ---
+            If IO.File.Exists(filename) Then
+                IO.File.Delete(filename)
+            End If
+
+            ' --- Define your channel colors here ---
+            Dim channelColors As New List(Of XLColor) From {
+            XLColor.FromColor(System.Drawing.Color.FromArgb(255, 200, 200)), ' Ch 0
+            XLColor.FromColor(System.Drawing.Color.FromArgb(200, 255, 200)), ' Ch 1
+            XLColor.FromColor(System.Drawing.Color.FromArgb(200, 200, 255)), ' Ch 2
+            XLColor.FromColor(System.Drawing.Color.FromArgb(255, 230, 180)), ' Ch 3
+            XLColor.FromColor(System.Drawing.Color.FromArgb(200, 255, 255)), ' Ch 4
+            XLColor.FromColor(System.Drawing.Color.FromArgb(255, 200, 255)), ' Ch 5
+            XLColor.FromColor(System.Drawing.Color.FromArgb(255, 255, 200)), ' Ch 6
+            XLColor.FromColor(System.Drawing.Color.FromArgb(220, 220, 220))  ' Ch 7
+        }
+
+            Using wb As New XLWorkbook()
+                Dim ws As IXLWorksheet = wb.Worksheets.Add("Data")
+
+                ' --- ADDED: Add Threshold and Baseline Info ---
+                ws.Cell("A1").Value = "Disturbance Threshold (%):"
+                ws.Cell("B1").Value = nudThreshold.Value
+
+                ' --- FIX: Use ws.Range() for multi-cell ranges ---
+                ws.Range("A1:B1").Style.Font.Bold = True
+
+                ws.Cell("A1").Style.Fill.BackgroundColor = XLColor.LightGray
+
+                ws.Cell("A3").Value = "Baseline Values:"
+                ws.Cell("A3").Style.Font.Bold = True
+                ws.Cell("A3").Style.Fill.BackgroundColor = XLColor.LightGray
+
+                ' Add baseline headers (Ch0, Ch1, ...) and values
+                For ch As Integer = 0 To ActiveChannels - 1
+                    ws.Cell(4, ch + 1).Value = $"Ch{ch}"
+                    ws.Cell(5, ch + 1).Value = baseline(ch)
+                Next
+
+                ' --- FIX: Use ws.Range() for multi-cell ranges ---
+                If ActiveChannels > 0 Then
+                    ws.Range(4, 1, 4, ActiveChannels).Style.Font.Bold = True
+                End If
+                ' ---  END: End of new info ---
+
+
+                ' --- Build header dynamically (shifted down) ---
+                Dim dataHeaderRow As Integer = 7 ' Start header on row 7
+                Dim colIndex As Integer = 1
+                ws.Cell(dataHeaderRow, colIndex).Value = "TimeStamp"
+                colIndex += 1
+                For ch As Integer = 0 To ActiveChannels - 1
+                    ws.Cell(dataHeaderRow, colIndex).Value = $"Ch{ch}_Val" : colIndex += 1
+                    ws.Cell(dataHeaderRow, colIndex).Value = $"Ch{ch}_Delta" : colIndex += 1
+                    ' ws.Cell(dataHeaderRow, colIndex).Value = $"Ch{ch}_Width" : colIndex += 1
+                    'ws.Cell(dataHeaderRow, colIndex).Value = $"Ch{ch}_FromLast" : colIndex += 1
+                Next
+                ws.Row(dataHeaderRow).Style.Font.Bold = True
+
+                ' --- Write data rows (shifted down) ---
+                Dim rowIndex As Integer = dataHeaderRow + 1 ' Start data on row 8
+
+                ' Get the threshold from UI (e.g., 5.0) and convert to a decimal (e.g., 0.05)
+                Dim thresholdPercent As Double = CType(nudThreshold.Value, Double) / 100.0
+
+                For Each row In dataList
+                    ws.Cell(rowIndex, 1).Value = row.Timestamp
+                    ws.Cell(rowIndex, 1).Style.DateFormat.Format = "dd mm:ss"
+                    colIndex = 2
+
+                    For ch As Integer = 0 To ActiveChannels - 1
+                        Dim val As Double = 0
+                        Dim delta As Double = 0
+                        Dim width As Integer? = Nothing
+                        Dim fromLast As Integer? = Nothing
+
+                        ' --- Get values for this channel ---
+                        Select Case ch
+                            Case 0
+                                val = row.Ch0_Val
+                                delta = row.Ch0_Delta
+                                'width = row.Ch0_Width
+                                'fromLast = row.Ch0_FromLast
+                            Case 1
+                                val = row.Ch1_Val
+                                delta = row.Ch1_Delta
+                                'width = row.Ch1_Width
+                                'fromLast = row.Ch1_FromLast
+                            Case 2
+                                val = row.Ch2_Val
+                                delta = row.Ch2_Delta
+                                'width = row.Ch2_Width
+                                'fromLast = row.Ch2_FromLast
+                            Case 3
+                                val = row.Ch3_Val
+                                delta = row.Ch3_Delta
+                                'width = row.Ch3_Width
+                                'fromLast = row.Ch3_FromLast
+                            Case 4
+                                val = row.Ch4_Val
+                                delta = row.Ch4_Delta
+                                'width = row.Ch4_Width
+                                'fromLast = row.Ch4_FromLast
+                            Case 5
+                                val = row.Ch5_Val
+                                delta = row.Ch5_Delta
+                                'width = row.Ch5_Width
+                                'fromLast = row.Ch5_FromLast
+                            Case 6
+                                val = row.Ch6_Val
+                                delta = row.Ch6_Delta
+                                'width = row.Ch6_Width
+                                'fromLast = row.Ch6_FromLast
+                            Case 7
+                                val = row.Ch7_Val
+                                delta = row.Ch7_Delta
+                                'width = row.Ch7_Width
+                                'fromLast = row.Ch7_FromLast
+                        End Select
+
+
+
+                        ' --- Write values to Excel ---
+                        Dim startCol As Integer = colIndex
+                        ws.Cell(rowIndex, colIndex).Value = val
+                        colIndex += 1
+                        ws.Cell(rowIndex, colIndex).Value = delta
+                        colIndex += 1
+
+                    Next ' --- End of dynamic channel loop ---
+
+                    rowIndex += 1
+                Next ' --- End of row loop ---
+
+                ws.Columns().AdjustToContents()
+                wb.SaveAs(filename)
+                Log($"Data saved to {filename}")
+            End Using
+        Catch ex As Exception
+            Log($"Error saving Excel file: {ex.Message}")
+        End Try
+    End Sub
+
+
+    Private Sub Form1_FormClosing(sender As Object, e As FormClosingEventArgs)
+        ' Save the current threshold value
+        My.Settings.LastThreshold = nudThreshold.Value
+        My.Settings.Save()
+    End Sub
+    ' ---------- Logging ----------
+    Private Sub Log(msg As String)
+        If textBoxLog.InvokeRequired Then
+            textBoxLog.Invoke(Sub() textBoxLog.AppendText(msg & Environment.NewLine))
+        Else
+            textBoxLog.AppendText(msg & Environment.NewLine)
+        End If
+    End Sub
+End Class
+
+' ---------- FbgData ----------
+Public Class FbgData
+    Public Property Index As Integer
+    Public Property Timestamp As DateTime
+    Public Property TimestampStr As String
+    ' The following properties are added to store the calculated wavelength data.
+    ' They must be Double since Delta and Wavelength are floating point numbers (nm).
+
+    ' Channel 0
+    Public Property Ch0_Val As Integer
+    Public Property Ch0_Delta As Integer
+
+    Public Property Ch0_DeltaNm As Double ' <<< NEW: Delta in nm
+    Public Property Ch0_Wavelength As Double ' <<< NEW: Current Wavelength in nm
+    Public Property Ch0_Frequency As Double ' <<< NEW: Frequency in THz
+
+    ' Channel 1
+    Public Property Ch1_Val As Integer
+    Public Property Ch1_Delta As Integer
+
+    Public Property Ch1_DeltaNm As Double ' <<< NEW
+    Public Property Ch1_Wavelength As Double ' <<< NEW
+    Public Property Ch1_Frequency As Double ' <<< NEW: Frequency in THz
+
+    ' Channel 2
+    Public Property Ch2_Val As Integer
+    Public Property Ch2_Delta As Integer
+
+    Public Property Ch2_DeltaNm As Double ' <<< NEW
+    Public Property Ch2_Wavelength As Double ' <<< NEW
+    Public Property Ch2_Frequency As Double ' <<< NEW: Frequency in THz
+
+    ' Channel 3
+    Public Property Ch3_Val As Integer
+    Public Property Ch3_Delta As Integer
+
+    Public Property Ch3_DeltaNm As Double ' <<< NEW
+    Public Property Ch3_Wavelength As Double ' <<< NEW
+    Public Property Ch3_Frequency As Double ' <<< NEW: Frequency in THz
+    ' Channel 4 (If used)
+    Public Property Ch4_Val As Integer
+    Public Property Ch4_Delta As Integer
+
+    Public Property Ch4_DeltaNm As Double ' <<< NEW
+    Public Property Ch4_Wavelength As Double ' <<< NEW
+    Public Property Ch4_Frequency As Double ' <<< NEW: Frequency in THz
+
+    ' Channel 5 (If used)
+    Public Property Ch5_Val As Integer
+    Public Property Ch5_Delta As Integer
+
+    Public Property Ch5_DeltaNm As Double ' <<< NEW
+    Public Property Ch5_Wavelength As Double ' <<< NEW
+    Public Property Ch5_Frequency As Double ' <<< NEW: Frequency in THz
+
+    ' Channel 6 (If used)
+    Public Property Ch6_Val As Integer
+    Public Property Ch6_Delta As Integer
+
+    Public Property Ch6_DeltaNm As Double ' <<< NEW
+    Public Property Ch6_Wavelength As Double ' <<< NEW
+    Public Property Ch6_Frequency As Double ' <<< NEW: Frequency in THz
+
+    ' Channel 7 (If used)
+    Public Property Ch7_Val As Integer
+    Public Property Ch7_Delta As Integer
+
+    Public Property Ch7_DeltaNm As Double ' <<< NEW
+    Public Property Ch7_Wavelength As Double ' <<< NEW
+    Public Property Ch7_Frequency As Double ' <<< NEW: Frequency in THz
+
+    ' Clone method must be updated to copy new fields
+    Public Function Clone() As FbgData
+        ' Start by typing the line below carefully
+        Dim cloneData As New FbgData With {
+        .Index = Me.Index,
+        .Timestamp = Me.Timestamp,
+        .TimestampStr = Me.TimestampStr,
+        .Ch0_Val = Me.Ch0_Val, .Ch0_Delta = Me.Ch0_Delta, .Ch0_DeltaNm = Me.Ch0_DeltaNm, .Ch0_Wavelength = Me.Ch0_Wavelength, .Ch0_Frequency = Me.Ch0_Frequency,
+        .Ch1_Val = Me.Ch1_Val, .Ch1_Delta = Me.Ch1_Delta, .Ch1_DeltaNm = Me.Ch1_DeltaNm, .Ch1_Wavelength = Me.Ch1_Wavelength, .Ch1_Frequency = Me.Ch1_Frequency,
+        .Ch2_Val = Me.Ch2_Val, .Ch2_Delta = Me.Ch2_Delta, .Ch2_DeltaNm = Me.Ch2_DeltaNm, .Ch2_Wavelength = Me.Ch2_Wavelength, .Ch2_Frequency = Me.Ch2_Frequency,
+        .Ch3_Val = Me.Ch3_Val, .Ch3_Delta = Me.Ch3_Delta, .Ch3_DeltaNm = Me.Ch3_DeltaNm, .Ch3_Wavelength = Me.Ch3_Wavelength, .Ch3_Frequency = Me.Ch3_Frequency,
+        .Ch4_Val = Me.Ch4_Val, .Ch4_Delta = Me.Ch4_Delta, .Ch4_DeltaNm = Me.Ch4_DeltaNm, .Ch4_Wavelength = Me.Ch4_Wavelength, .Ch4_Frequency = Me.Ch4_Frequency,
+        .Ch5_Val = Me.Ch5_Val, .Ch5_Delta = Me.Ch5_Delta, .Ch5_DeltaNm = Me.Ch5_DeltaNm, .Ch5_Wavelength = Me.Ch5_Wavelength, .Ch5_Frequency = Me.Ch5_Frequency,
+        .Ch6_Val = Me.Ch6_Val, .Ch6_Delta = Me.Ch6_Delta, .Ch6_DeltaNm = Me.Ch6_DeltaNm, .Ch6_Wavelength = Me.Ch6_Wavelength, .Ch6_Frequency = Me.Ch6_Frequency,
+        .Ch7_Val = Me.Ch7_Val, .Ch7_Delta = Me.Ch7_Delta, .Ch7_DeltaNm = Me.Ch7_DeltaNm, .Ch7_Wavelength = Me.Ch7_Wavelength, .Ch7_Frequency = Me.Ch7_Frequency
+    }
+        Return cloneData
+    End Function
+
+End Class
+
+
+Module DataGridViewExtensions
+    <System.Runtime.CompilerServices.Extension()>
+    Public Sub DoubleBuffered(dgv As DataGridView, setting As Boolean)
+        Dim dgvType As Type = dgv.GetType()
+        Dim pi = dgvType.GetProperty("DoubleBuffered", Reflection.BindingFlags.Instance Or Reflection.BindingFlags.NonPublic)
+        pi.SetValue(dgv, setting, Nothing)
+    End Sub
+
+End Module
