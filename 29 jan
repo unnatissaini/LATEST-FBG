@@ -552,6 +552,7 @@ Public Class Form1
             formsPlot1.Plot.Axes.Bottom.TickGenerator = New ScottPlot.TickGenerators.NumericManual(customTicks.ToArray())
             formsPlot1.Plot.Axes.SetLimitsX(0, SpectrumLength)
             formsPlot1.Plot.Axes.SetLimitsY(0, 1.2)
+            formsPlot1.Plot.Axes.DateTimeTicksBottom()
 
             ' Hide Left Axis Ticks
             formsPlot1.Plot.Axes.Left.TickLabelStyle.IsVisible = False
@@ -636,8 +637,10 @@ Public Class Form1
 
                 If parts.Length < ActiveChannels Then Continue While
 
-                tempData.Index = currentIndex
-                currentIndex += 1
+                'tempData.Index = currentIndex
+                'currentIndex += 1
+                data.Timestamp = DateTime.Now
+data.TimestampStr = data.Timestamp.ToString("yyyy-MM-dd HH:mm:ss.fff")
 
                 'Dim thresholdPercent As Double = 0.05
                 ' Use the user-selected threshold from NumericUpDown
@@ -990,9 +993,10 @@ Public Class Form1
 
                 If valid AndAlso parts.Length >= ActiveChannels Then
                     ' Add to processing queue (or process directly)
-                    tempData.Index = currentIndex
-                    currentIndex += 1
-
+                    'tempData.Index = currentIndex
+                    'currentIndex += 1
+                    data.Timestamp = DateTime.Now
+data.TimestampStr = data.Timestamp.ToString("yyyy-MM-dd HH:mm:ss.fff")
                     ' Process logic (Calculates Deltas, etc.)
                     ProcessIncomingData(parts)
                 End If
@@ -1215,7 +1219,8 @@ Public Class Form1
     Private Sub UpdatePlot()
         ' --- 1. HANDLING LINEAR MODE ---
         If isLinearMode Then
-            Dim xOffset As Double = currentIndex - MaxPlotPoints
+            'Dim xOffset As Double = currentIndex - MaxPlotPoints
+            Dim xValue As Double = latestData.Timestamp.ToOADate()
             For ch As Integer = 0 To ActiveChannels - 1
                 If plotLinearSignals(ch) IsNot Nothing Then
                     plotLinearSignals(ch).Data.XOffset = xOffset
@@ -1578,7 +1583,9 @@ Public Class Form1
             ' --- Write data rows dynamically ---
             For Each row In dataList
                 Dim values As New List(Of String)
-                values.Add(row.Index.ToString())
+                'values.Add(row.Index.ToString())
+                values.Add(row.Timestamp.ToString("yyyy-MM-dd HH:mm:ss.fff"))
+
                 For ch As Integer = 0 To ActiveChannels - 1
                     Select Case ch
                         Case 0
@@ -1698,7 +1705,7 @@ Public Class Form1
 
                 For Each row In dataList
                     ws.Cell(rowIndex, 1).Value = row.Timestamp
-                    ws.Cell(rowIndex, 1).Style.DateFormat.Format = "dd mm:ss"
+                    ws.Cell(rowIndex, 1).Style.DateFormat.Format = "yyyy-mm-dd hh:mm:ss.000"
                     colIndex = 2
 
                     For ch As Integer = 0 To ActiveChannels - 1
@@ -1792,7 +1799,7 @@ End Class
 
 ' ---------- FbgData ----------
 Public Class FbgData
-    Public Property Index As Integer
+    'Public Property Index As Integer
     Public Property Timestamp As DateTime
     Public Property TimestampStr As String
     ' The following properties are added to store the calculated wavelength data.
@@ -1865,7 +1872,7 @@ Public Class FbgData
     Public Function Clone() As FbgData
         ' Start by typing the line below carefully
         Dim cloneData As New FbgData With {
-        .Index = Me.Index,
+        '.Index = Me.Index,
         .Timestamp = Me.Timestamp,
         .TimestampStr = Me.TimestampStr,
         .Ch0_Val = Me.Ch0_Val, .Ch0_Delta = Me.Ch0_Delta, .Ch0_DeltaNm = Me.Ch0_DeltaNm, .Ch0_Wavelength = Me.Ch0_Wavelength, .Ch0_Frequency = Me.Ch0_Frequency,
